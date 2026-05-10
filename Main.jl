@@ -19,7 +19,7 @@ const CHUNKS = [
 
 const CACHE_DIR = "chunk_cache"
 const MODEL_PATH = "model.jld2"
-const ARCH_VERSION = "rescnn-v2"
+const ARCH_VERSION = "rescnn-v3"
 
 CUDA.functional() && CUDA.allowscalar(false)
 
