@@ -52,9 +52,9 @@ idk_what_this_returns = DuckDB.query(con, """
     FROM read_parquet([$parquet_paths_sql]);
 """)
 ## drop a column if u need to
-DuckDB.execute(con, """
-    ALTER TABLE IRSpectra DROP COLUMN "'Frequency(cm^-1)'";
-""")
+#DuckDB.execute(con, """
+#    ALTER TABLE IRSpectra DROP COLUMN "'Frequency(cm^-1)'";
+#""")
 # pro tip: if you have the same value for all rows its not inefficient and
 # if u dropped a column like that it was all deduplicated and the space u gained is like kilobytes max
 ##
@@ -66,7 +66,7 @@ DuckDB.query(con, """
     DESCRIBE IRSpectra;
 """)
 ##
-DuckDB.query(con, """
-    ALTER TABLE IRSpectra
-    ALTER COLUMN ir_spectra SET DATA TYPE FLOAT[12000];
-""")
+#DuckDB.query(con, """
+#    ALTER TABLE IRSpectra
+#    ALTER COLUMN ir_spectra SET DATA TYPE FLOAT[12000];
+#""")
