@@ -56,11 +56,11 @@ const FG_PATTERNS = Dict(
 =#
 
 const FG_SMARTS = Dict(
-  "Chlorine" => "[CX4][Cl]",  # C-Cl (aliphatic)
-  "Ester Linkage" => "[#6][CX3](=O)[OX2][#6]",  # R-C(=O)-O-R"
-  "Aromatic Ring" => "c1ccccc1",
-  "Methyl Branch" => "[CH3]",
-  "Ethylene Backbone" => "[CH2]"
+    "Chlorine"          => "[Cl]",
+    "Ester Linkage"     => "[CX3](=O)[OX2]",
+    "Aromatic Ring"     => "c1ccccc1",
+    "Methyl Branch"     => "[CH3]",
+    "Ethylene Backbone" => "[CH2]"
 )
 const FG_NAMES = sort(collect(keys(FG_SMARTS)))
 const N_FG     = length(FG_NAMES)

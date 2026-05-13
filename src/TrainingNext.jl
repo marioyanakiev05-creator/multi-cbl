@@ -8,7 +8,7 @@ function save_checkpoint(model, opt_state, epoch, best_val_loss)
     println("  Saving checkpoint at epoch $epoch (val loss = $(round(best_val_loss, digits=4)))")
     JLD2.save(CHECKPOINT_PATH,
         "model_state",    Flux.state(MLDataDevices.cpu_device()(model)),
-        "opt_state",      Flux.state(MLDataDevices.cpu_device()(opt_state)),  
+        "opt_state",      Flux.state(MLDataDevices.cpu_device()(opt_state)),
         "epoch",          epoch,
         "best_val_loss",  best_val_loss,
         "arch_version",   ARCH_VERSION,
@@ -32,7 +32,6 @@ function load_checkpoint!(model, opt_state)
 
     Flux.loadmodel!(model, cpu_model_state)
 
-    # Restore opt state — works even if checkpoint has no opt_state (old model files)
     try
         Flux.loadmodel!(opt_state, cpu_opt_state)
         println("  Restored optimizer state.")
@@ -42,6 +41,21 @@ function load_checkpoint!(model, opt_state)
 
     println("  Resuming from epoch $(epoch+1), best val loss = $(round(best_val_loss, digits=4))")
     return epoch, Float32(best_val_loss)
+end
+
+# Weights per class — order matches sorted FG_NAMES:
+# [Aromatic Ring, Chlorine, Ester Linkage, Ethylene Backbone, Methyl Branch]
+# Chlorine (index 2) is rare so its errors are penalised more heavily
+
+#added weights
+const CLASS_WEIGHTS = reshape(Float32[1f0, 1f0, 1f0, 1f0, 1f0], N_FG, 1)
+
+function weighted_focal_loss(logits, y; gamma=2f0)
+    p = clamp.(sigmoid.(logits), 1f-6, 1f0 - 1f-6)
+    w = MLDataDevices.gpu_device()(CLASS_WEIGHTS)
+    pos = -y        .* (1f0 .- p).^gamma .* log.(p)
+    neg = -(1f0.-y) .*         p .^gamma .* log.(1f0 .- p)
+    return mean(w .* (pos .+ neg))
 end
 
 function train_model!(model, chunk_paths::Vector{String},
@@ -57,7 +71,6 @@ function train_model!(model, chunk_paths::Vector{String},
 
     opt_state = Flux.setup(Adam(lr_start), model)
 
-    # --- Resume from checkpoint if available ---
     start_epoch, best_val_loss = resume ? load_checkpoint!(model, opt_state) : (0, Inf32)
     epochs_no_improve = 0
 
@@ -65,11 +78,11 @@ function train_model!(model, chunk_paths::Vector{String},
                             partial=false, parallel=true) |> dev
 
     loss_fn(m, x, y) = Flux.binary_focal_loss(
-        clamp.(sigmoid(m(x)), 1f-6, 1f0 - 1f-6), y, gamma=2)
+         clamp.(sigmoid(m(x)), 1f-6, 1f0 - 1f-6), y, gamma=2)
+    #loss_fn(m, x, y) = weighted_focal_loss(m(x), y; gamma=2f0)
 
     @showprogress desc="Epochs" for e in (start_epoch+1):epochs
 
-        # --- Cosine LR decay ---
         lr = lr_min + 0.5f0 * (lr_start - lr_min) *
              (1f0 + cos(Float32(π) * (e - 1f0) / (epochs - 1f0)))
         Flux.adjust!(opt_state, lr)
@@ -91,7 +104,6 @@ function train_model!(model, chunk_paths::Vector{String},
             end
         end
 
-        # --- Validation ---
         Flux.testmode!(model)
         val_loss = 0f0
         n_val    = 0
@@ -103,7 +115,6 @@ function train_model!(model, chunk_paths::Vector{String},
 
         @printf("Epoch %2d | val loss = %.4f | lr = %.2e\n", e, val_loss, lr)
 
-        # --- Checkpoint if improved ---
         if val_loss < best_val_loss
             best_val_loss      = val_loss
             epochs_no_improve  = 0
@@ -113,14 +124,12 @@ function train_model!(model, chunk_paths::Vector{String},
             println("  No improvement ($epochs_no_improve/$patience)")
         end
 
-        # --- Early stopping ---
         if epochs_no_improve >= patience
             println("\nEarly stopping at epoch $e (no improvement for $patience epochs)")
             break
         end
     end
 
-    # --- Restore best weights ---
     if isfile(CHECKPOINT_PATH)
         println("\nRestoring best model weights from checkpoint...")
         best_state = JLD2.load(CHECKPOINT_PATH, "model_state")
