@@ -13,13 +13,17 @@ include("src/ModelTransformer.jl")
 include("src/LoadData.jl")
 include("src/TrainingNext.jl")
 
+#const CHUNKS = [
+#    "src/parquet-files/data/IR_data_chunk00$(i)_of_009.parquet" for i in 1:9
+#]
+
 const CHUNKS = [
-    "src/parquet-files/data/IR_data_chunk00$(i)_of_009.parquet" for i in 1:9
+    "src/parquet-files/data/IR_data_chunk$(lpad(i, 3, '0'))_of_020.parquet" for i in 1:20
 ]
 
 const CACHE_DIR = "chunk_cache"
 const MODEL_PATH = "model.jld2"
-#const ARCH_VERSION = "rescnn-v9"
+const ARCH_VERSION = "rescnn-v10"
 
 CUDA.functional() && CUDA.allowscalar(false)
 
@@ -111,6 +115,7 @@ function main()
     tp = vec(sum(pred_bin .& (Yt_cpu .== 1f0), dims=2))
     fp = vec(sum(pred_bin .& (Yt_cpu .== 0f0), dims=2))
     fn = vec(sum((pred_bin .== 0f0) .& (Yt_cpu .== 1f0), dims=2))
+    tn = vec(sum((pred_bin .== 0f0) .& (Yt_cpu .== 0f0), dims=2))
 
     precision = tp ./ (tp .+ fp .+ eps(Float32))
     recall    = tp ./ (tp .+ fn .+ eps(Float32))
@@ -124,6 +129,9 @@ function main()
     for (i, name) in enumerate(FG_NAMES)
         acc_i = mean(pred_bin[i, :] .== Yt_cpu[i, :])
         @printf("  %-20s accuracy: %6.2f%%   F1: %6.2f%%\n", name, 100 * acc_i, 100 * f1[i])
+        println("                          Predicted 0   Predicted 1")
+        @printf("    Actual 0 (negative):  %8d      %8d      (TN | FP)\n", tn[i], fp[i])
+        @printf("    Actual 1 (positive):  %8d      %8d      (FN | TP)\n", fn[i], tp[i])
     end
 end
 

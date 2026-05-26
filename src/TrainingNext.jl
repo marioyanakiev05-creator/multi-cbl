@@ -50,7 +50,7 @@ end
 #added weights
 const CLASS_WEIGHTS = reshape(Float32[1f0, 1f0, 1f0, 1f0, 1f0], N_FG, 1)
 
-function weighted_focal_loss(logits, y; gamma=2f0)
+function weighted_focal_loss(logits, y; gamma=0f0)
     p = clamp.(sigmoid.(logits), 1f-6, 1f0 - 1f-6)
     w = MLDataDevices.gpu_device()(CLASS_WEIGHTS)
     pos = -y        .* (1f0 .- p).^gamma .* log.(p)
@@ -78,7 +78,7 @@ function train_model!(model, chunk_paths::Vector{String},
                             partial=false, parallel=true) |> dev
 
     loss_fn(m, x, y) = Flux.binary_focal_loss(
-         clamp.(sigmoid(m(x)), 1f-6, 1f0 - 1f-6), y, gamma=2)
+         clamp.(sigmoid(m(x)), 1f-6, 1f0 - 1f-6), y, gamma=0.6f0)
     #loss_fn(m, x, y) = weighted_focal_loss(m(x), y; gamma=2f0)
 
     @showprogress desc="Epochs" for e in (start_epoch+1):epochs

@@ -56,8 +56,8 @@ const FG_PATTERNS = Dict(
 =#
 
 const FG_SMARTS = Dict(
-    "Chlorine"          => "[Cl]",
-    "Ester Linkage"     => "[CX3](=O)[OX2]",
+    "Chlorine"          => "[CX4][Cl]",  
+    "Ester Linkage"     => "[#6][CX3](=O)[OX2][#6]",
     "Aromatic Ring"     => "c1ccccc1",
     "Methyl Branch"     => "[CH3]",
     "Ethylene Backbone" => "[CH2]"
