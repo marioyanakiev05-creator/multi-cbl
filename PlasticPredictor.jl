@@ -1,38 +1,81 @@
 # Predicts plastic types based on IR measurement.
 # Preprocessing: transmittance -> absorbance -> normalizer fitted on lab batch.
+# Interpolation uses Interpolations.jl; training grid is read from the parquet data.
 
 using Pkg
 Pkg.activate(".")
 
 using Flux, MLDataDevices, JLD2, Statistics, Printf, DelimitedFiles, PythonCall
+using DuckDB, DBInterface, DataFrames
+using Interpolations
 
 include("src/Featurization.jl")
 include("src/ModelNext.jl")
-
-# Wavenumber range of IR spectra (cm⁻¹)
-const TRAIN_WAVENUMBERS = 400:2:3998
 
 # Plastic types
 const PLASTIC_TYPES = ["PET", "PE", "PVC", "PP", "PS", "Other"]
 
 ############################################################
 # STRUCT
+# train_wavenumbers is loaded from the parquet data and stored
+# here so every function has access to the correct training grid.
 ############################################################
 
 struct LoadedModel
-    model        ::Chain
-    norm_mu      ::Vector{Float32}
-    norm_sigma   ::Vector{Float32}
-    spec_len     ::Int
-    fg_names     ::Vector{String}
-    arch_version ::String
+    model             ::Chain
+    norm_mu           ::Vector{Float32}
+    norm_sigma        ::Vector{Float32}
+    spec_len          ::Int
+    fg_names          ::Vector{String}
+    arch_version      ::String
+    train_wavenumbers ::Vector{Float64}
+end
+
+############################################################
+# TRAINING GRID
+# Reads the wavenumber axis from one parquet chunk.
+# If the file has an explicit frequency column (e.g. Frequency(cm^-1))
+# that column is used directly.
+# If not, a linear axis over 400–4000 cm⁻¹ is derived from spec_len.
+############################################################
+
+function load_train_wavenumbers(parquet_path::String, spec_len::Int)::Vector{Float64}
+    con    = DBInterface.connect(DuckDB.DB, ":memory:")
+    schema = DBInterface.execute(con,
+        "DESCRIBE SELECT * FROM read_parquet('$parquet_path') LIMIT 1") |> DataFrame
+
+    freq_col = nothing
+    for col in schema.column_name
+        lc = lowercase(col)
+        if occursin("freq", lc) || occursin("wave", lc) || occursin("cm", lc)
+            freq_col = col
+            break
+        end
+    end
+
+    if !isnothing(freq_col)
+        df = DBInterface.execute(con,
+            "SELECT \"$freq_col\" FROM read_parquet('$parquet_path') LIMIT 1") |> DataFrame
+        wn = sort(Float64.(collect(df[1, 1])))
+        DBInterface.close!(con)
+        @printf("Training grid: %.2f – %.2f cm⁻¹  (%d pts, %.4f cm⁻¹/pt)\n",
+                wn[1], wn[end], length(wn), (wn[end]-wn[1])/(length(wn)-1))
+        return wn
+    else
+        DBInterface.close!(con)
+        println("No frequency column found — deriving grid from spec_len=$spec_len, assuming 400–4000 cm⁻¹")
+        return collect(range(400.0, 4000.0, length=spec_len))
+    end
 end
 
 ############################################################
 # MODEL LOADING
+# parquet_path is used only to read the training wavenumber axis.
 ############################################################
 
-function load_model(path::String = "model.jld2")::Union{LoadedModel, Nothing}
+function load_model(path        ::String = "model.jld2",
+                    parquet_path::String = "src/parquet-files/data/IR_data_chunk001_of_009.parquet"
+                    )::Union{LoadedModel, Nothing}
     if !isfile(path)
         println("No model found at $path")
         return nothing
@@ -49,35 +92,28 @@ function load_model(path::String = "model.jld2")::Union{LoadedModel, Nothing}
     Flux.loadmodel!(model, JLD2.load(path, "model_state"))
     Flux.testmode!(model)
 
-    println("Model loaded successfully (arch version: $arch_version)")
-    return LoadedModel(model, norm_mu, norm_sigma, spec_len, fg_names, arch_version)
+    train_wn = load_train_wavenumbers(parquet_path, spec_len)
+
+    println("Model loaded successfully (arch version: $arch_version, spec_len: $spec_len)")
+    return LoadedModel(model, norm_mu, norm_sigma, spec_len, fg_names, arch_version, train_wn)
 end
 
 ############################################################
 # PREPROCESSING
 ############################################################
 
-# Interpolate a measured spectrum onto the training wavenumber grid.
-function interpolate_spectrum(wn_meas, spectrum)
-    ascending_indices = sortperm(wn_meas)
-    wn_meas_sorted    = wn_meas[ascending_indices]
-    spectrum_sorted   = spectrum[ascending_indices]
+# Interpolate a measured spectrum onto the training wavenumber grid
+# using linear interpolation from Interpolations.jl.
+# Values outside the measured range are held at the nearest boundary (Flat()).
+function interpolate_spectrum(wn_meas  ::Vector{Float64},
+                               spectrum ,
+                               train_wn ::Vector{Float64})::Vector{Float32}
+    order     = sortperm(wn_meas)
+    wn_sorted = wn_meas[order]
+    sp_sorted = Float64.(spectrum[order])
 
-    interpolated = zeros(Float32, length(TRAIN_WAVENUMBERS))
-    for (i, wn) in enumerate(TRAIN_WAVENUMBERS)
-        idx_right = findfirst(x -> x >= wn, wn_meas_sorted)
-        if idx_right === nothing
-            interpolated[i] = spectrum_sorted[end]
-        elseif idx_right == 1
-            interpolated[i] = spectrum_sorted[1]
-        else
-            idx_left = idx_right - 1
-            x0, y0  = wn_meas_sorted[idx_left],  spectrum_sorted[idx_left]
-            x1, y1  = wn_meas_sorted[idx_right], spectrum_sorted[idx_right]
-            interpolated[i] = y0 + (y1 - y0) * (wn - x0) / (x1 - x0)
-        end
-    end
-    return interpolated
+    itp = linear_interpolation(wn_sorted, sp_sorted, extrapolation_bc=Flat())
+    return Float32.(itp.(train_wn))
 end
 
 # Convert %Transmittance to Absorbance.
@@ -96,8 +132,7 @@ function normalize_spectrum(spectrum  ::Vector{Float32},
 end
 
 # Fit a normalizer from a batch of absorbance spectra.
-# Returns (mu, sigma) as Float32 vectors.
-# Must be called on a batch — a single spectrum has no meaningful statistics.
+# Must be called on a batch — fitting on a single spectrum is meaningless.
 function get_lab_normalizer(spectra_abs::Vector{Vector{Float32}})
     mat   = hcat(spectra_abs...)
     mu    = Float32.(vec(mean(mat, dims=2)))
@@ -151,21 +186,19 @@ end
 ############################################################
 # SINGLE MEASUREMENT PREDICTION
 #
-# Requires lab_mu and lab_sigma computed from a batch via
-# get_lab_normalizer. Normalising a single spectrum in
-# isolation is not meaningful — obtain these statistics from
-# prepare_data_lab_session first.
+# Requires lab_mu and lab_sigma from get_lab_normalizer,
+# computed over the same batch the measurement belongs to.
 ############################################################
 
-function predict_plastic_type(wn_meas    ,
-                               spectrum  ,
+function predict_plastic_type(wn_meas     ::Vector{Float64},
+                               spectrum   ,
                                loaded_model::LoadedModel,
-                               lab_mu    ::Vector{Float32},
-                               lab_sigma ::Vector{Float32};
-                               threshold ::Float32 = 0.5f0,
-                               verbose   ::Bool    = true)
+                               lab_mu     ::Vector{Float32},
+                               lab_sigma  ::Vector{Float32};
+                               threshold  ::Float32 = 0.5f0,
+                               verbose    ::Bool    = true)
 
-    interp     = interpolate_spectrum(wn_meas, spectrum)
+    interp     = interpolate_spectrum(wn_meas, spectrum, loaded_model.train_wavenumbers)
     absorbance = transmittance_to_absorbance(interp)
     normalised = normalize_spectrum(absorbance, lab_mu, lab_sigma)
 
@@ -184,8 +217,7 @@ end
 
 ############################################################
 # BATCH EVALUATION
-# Expects spectra already fully preprocessed by
-# prepare_data_lab_session.
+# Expects spectra already fully preprocessed by prepare_data_lab_session.
 ############################################################
 
 function evaluate_batch(spectra     ::Vector{Vector{Float32}},
@@ -277,13 +309,13 @@ const LABEL_MAP = Dict(
 
 # Load all CSV files from a lab session folder.
 # Pipeline per spectrum:
-#   1. Interpolate onto training grid
+#   1. Interpolate onto training grid (from loaded_model.train_wavenumbers)
 #   2. Convert transmittance -> absorbance
 # Then fit a normalizer across the whole batch and apply it.
-#
-# Returns preprocessed spectra, true labels, and the fitted
-# (lab_mu, lab_sigma) so they can be reused for single predictions.
-function prepare_data_lab_session(folder_session::String = "experimental_data/lab_session_1")
+# Returns preprocessed spectra, true labels, and (lab_mu, lab_sigma)
+# for reuse in single predictions from the same session.
+function prepare_data_lab_session(loaded_model  ::LoadedModel,
+                                   folder_session::String = "experimental_data/lab_session_1")
     csv_files = sort(filter(f -> endswith(f, ".csv"), readdir(folder_session, join=true)))
 
     spectra_abs = Vector{Vector{Float32}}()
@@ -294,7 +326,7 @@ function prepare_data_lab_session(folder_session::String = "experimental_data/la
         wn_meas  = data[:, 1]
         spectrum = Float32.(data[:, 2])
 
-        interp     = interpolate_spectrum(wn_meas, spectrum)
+        interp     = interpolate_spectrum(wn_meas, spectrum, loaded_model.train_wavenumbers)
         absorbance = transmittance_to_absorbance(interp)
         push!(spectra_abs, absorbance)
 
@@ -303,7 +335,6 @@ function prepare_data_lab_session(folder_session::String = "experimental_data/la
         push!(true_labels, get(LABEL_MAP, label_key, "Other"))
     end
 
-    # Fit normalizer on the full lab batch, then apply to every spectrum
     lab_mu, lab_sigma = get_lab_normalizer(spectra_abs)
     spectra_norm = [normalize_spectrum(s, lab_mu, lab_sigma) for s in spectra_abs]
 
@@ -320,7 +351,7 @@ function run_evaluation_session_pipeline_from_loaded_model(
         folder_session::String  = "experimental_data/lab_session_1",
         threshold     ::Float32 = 0.5f0)
 
-    spectra, true_labels, _, _ = prepare_data_lab_session(folder_session)
+    spectra, true_labels, _, _ = prepare_data_lab_session(loaded_model, folder_session)
     predicted_labels = evaluate_batch(spectra, loaded_model, threshold)
     overall_acc, macro_f1, conf_matrix = evaluate_performance_batch(true_labels, predicted_labels)
     return overall_acc, macro_f1, conf_matrix
@@ -328,10 +359,115 @@ end
 
 function run_evaluation_session_from_model_path(
         model_path    ::String,
+        parquet_path  ::String  = "src/parquet-files/data/IR_data_chunk001_of_009.parquet",
         folder_session::String  = "experimental_data/lab_session_1",
         threshold     ::Float32 = 0.5f0)
 
-    loaded_model = load_model(model_path)
+    loaded_model = load_model(model_path, parquet_path)
     loaded_model === nothing && return
     return run_evaluation_session_pipeline_from_loaded_model(loaded_model, folder_session, threshold)
+end
+
+############################################################
+# ZENODO PLASTICS DATASET
+# Folder structure:
+#   experimental_data/zenodo_plastics_dataset/
+#     LDPE-c4/LDPE1.csv ... LDPE500.csv
+#     HDPE-c4/HDPE1.csv ... HDPE500.csv
+#     PET-c4/ ...
+#     PP-c4/  ...
+#     PS-c4/  ...
+#     PVC-c4/ ...
+#
+# Each CSV has 15 metadata header lines followed by two-column
+# data: wavenumber (cm⁻¹), transmittance (%T).
+############################################################
+
+const ZENODO_LABEL_MAP = Dict(
+    "LDPE_c4" => "PE",
+    "HDPE_c4" => "PE",
+    "PET_c4"  => "PET",
+    "PP_c4"   => "PP",
+    "PS_c4"   => "PS",
+    "PVC_c4"  => "PVC"
+)
+
+const ZENODO_HEADER_LINES = 15
+
+# Load a single zenodo CSV: skip the 15 metadata lines, parse wavenumber + transmittance.
+function load_zenodo_spectrum(filepath::String)
+    wn   = Float64[]
+    spec = Float32[]
+    open(filepath, "r") do f
+        for _ in 1:ZENODO_HEADER_LINES
+            readline(f)
+        end
+        for line in eachline(f)
+            parts = split(strip(line), ',')
+            length(parts) == 2 || continue
+            push!(wn,   parse(Float64, parts[1]))
+            push!(spec, parse(Float32, parts[2]))
+        end
+    end
+    return wn, spec
+end
+
+# Load all spectra from all plastic-type subfolders.
+# Pipeline per spectrum:
+#   1. Interpolate onto training grid
+#   2. Convert transmittance -> absorbance
+# Then fit a normalizer across the full batch and apply it.
+# Returns preprocessed spectra, true labels, and (lab_mu, lab_sigma).
+function prepare_data_zenodo_dataset(loaded_model::LoadedModel,
+                                      folder      ::String = "experimental_data/zenodo_plastics_dataset")
+
+    subfolders  = sort(filter(d -> isdir(joinpath(folder, d)), readdir(folder)))
+    spectra_abs = Vector{Vector{Float32}}()
+    true_labels = Vector{String}()
+
+    for subfolder in subfolders
+        label          = get(ZENODO_LABEL_MAP, subfolder, "Other")
+        subfolder_path = joinpath(folder, subfolder)
+        csv_files      = sort(filter(f -> endswith(f, ".csv"),
+                                     readdir(subfolder_path, join=true)))
+
+        for filepath in csv_files
+            wn, spectrum = load_zenodo_spectrum(filepath)
+            interp       = interpolate_spectrum(wn, spectrum, loaded_model.train_wavenumbers)
+            absorbance   = transmittance_to_absorbance(interp)
+            push!(spectra_abs, absorbance)
+            push!(true_labels, label)
+        end
+
+        println("  $(rpad(subfolder, 10)) → $label  ($(length(csv_files)) spectra)")
+    end
+
+    lab_mu, lab_sigma = get_lab_normalizer(spectra_abs)
+    spectra_norm = [normalize_spectrum(s, lab_mu, lab_sigma) for s in spectra_abs]
+
+    println("Total: $(length(spectra_norm)) spectra prepared from $folder")
+    return spectra_norm, true_labels, lab_mu, lab_sigma
+end
+
+# Run the full evaluation pipeline on the zenodo dataset.
+function run_evaluation_zenodo_dataset_from_loaded_model(
+        loaded_model::LoadedModel,
+        folder      ::String  = "experimental_data/zenodo_plastics_dataset",
+        threshold   ::Float32 = 0.5f0)
+
+    spectra, true_labels, _, _ = prepare_data_zenodo_dataset(loaded_model, folder)
+    predicted_labels = evaluate_batch(spectra, loaded_model, threshold)
+    overall_acc, macro_f1, conf_matrix = evaluate_performance_batch(true_labels, predicted_labels)
+    return overall_acc, macro_f1, conf_matrix
+end
+
+function run_evaluation_zenodo_dataset_from_model_path(
+        model_path  ::String,
+        parquet_path::String  = "src/parquet-files/data/IR_data_chunk001_of_020.parquet",
+        folder      ::String  = "experimental_data/zenodo_plastics_dataset",
+        threshold   ::Float32 = 0.5f0)
+
+    loaded_model = load_model(model_path, parquet_path)
+    loaded_model === nothing && return
+    return run_evaluation_zenodo_dataset_from_loaded_model(loaded_model, folder, threshold)
 end
