@@ -3,10 +3,12 @@
 using Pkg
 Pkg.activate(".")
 
-using Flux, MLDataDevices, JLD2, Statistics, Printf
+using Flux, MLDataDevices, JLD2, Statistics, Printf, DelimitedFiles, PythonCall
+
 
 include("src/Featurization.jl")
 include("src/ModelNext.jl")
+
 
 # Wavenumber range of IR spectra (cm⁻¹)
 const TRAIN_WAVENUMBERS = 400:2:3998
@@ -27,7 +29,7 @@ end
 
 # Load Model
 
-function load_model(path::String = "model.jld2")::LoadedModel
+function load_model(path::String = "model.jld2")::Union{LoadedModel, Nothing}
     if !isfile(path)
         println("No model found at $path")
         return nothing
@@ -92,17 +94,16 @@ function preprocess_spectrum(wn_meas, spectrum, loaded_model::LoadedModel) :: Ve
 end
 
 # Predict functional groups from the preprocessed spectrum
-function predict_functional_groups(LoadedModel :: LoadedModel, preprocessed_spectrum::Vector{Float32}, threshold :: Float32 = 0.5f0)
-    dev = MLDataDevices.cpu_device()
-    reshaped_spectrum = dev(reshape(preprocessed_spectrum, LoadedModel.spec_len, 1))  
-    outputsize = MLDataDevices.cpu_device()(LoadedModel.model(reshaped_spectrum))
-    probabilities = sigmoid.(outputsize)
-    binary_predictions = probabilities .> threshold
+function predict_functional_groups(loaded_model::LoadedModel, preprocessed_spectrum::Vector{Float32}, threshold :: Float32 = 0.5f0)
+    reshaped_spectrum = MLDataDevices.gpu_device()(reshape(preprocessed_spectrum, loaded_model.spec_len, 1))
+    outputsize = MLDataDevices.cpu_device()(loaded_model.model(reshaped_spectrum)) 
+    probabilities = vec(sigmoid.(outputsize))
+    binary_predictions = vec(probabilities .> threshold)
     return probabilities, binary_predictions
 end
 
 # Identify polimer based on predicted functional groups
-function functional_groups_to_plastic(binary_predictions ::Vector{Bool}, fg_names :: Vector{String}) :: String
+function functional_groups_to_plastic(binary_predictions ::AbstractVector{Bool}, fg_names :: Vector{String}) :: String
     indexes = Dict(name => idx for (idx, name) in enumerate(fg_names))
 
     ar = binary_predictions[indexes["Aromatic Ring"]]
@@ -120,7 +121,7 @@ function functional_groups_to_plastic(binary_predictions ::Vector{Bool}, fg_name
             return "PS"
         end
     elseif mb && !ar && !el
-        return "pp"
+        return "PP"
     elseif eb && !ar && !el && !mb
         return "PE"
     else
@@ -146,7 +147,7 @@ end
 
 #Evaluate a batch of measurements
 
-function evaluate_batch(spectra :: Vector{Vector{Float32}}, wn_meas, loaded_model :: LoadedModel, threshold :: Float32 = 0.5f0, true_labels :: Vector{String})
+function evaluate_batch(spectra :: Vector{Vector{Float32}}, wn_meas, loaded_model :: LoadedModel, threshold :: Float32 = 0.5f0)
     shared_wn = isa(wn_meas, Vector{<:Real})
     predictions = Vector{String}(undef, length(spectra))
     for (i, spectrum) in enumerate(spectra)
@@ -231,5 +232,64 @@ function evaluate_performance_batch(true_labels :: Vector{String}, predicted_lab
 
     # Return metrics in case you want to use them programmatically later
     return overall_accuracy, macro_f1, matrix_confusion
+end
+
+
+# Match lables from file names
+
+const LABEL_MAP = Dict(
+    "HDPE"    => "PE",
+    "LDPE"    => "PE",
+    "PET"     => "PET",
+    "PP"      => "PP",
+    "PS"      => "PS",
+    "PVC"     => "PVC",
+    "Nitrile" => "Other"
+)
+
+#Return parallel vectors of vectors of spectra, wavenumber, true label (each csv file has two columns - first one for wavenumbers, second one for spectra, no titles, separated by commas)
+function prepare_data_lab_session(folder_session::String = "experimental_data/lab_session_1")
+    csv_files = sort(filter(f -> endswith(f, ".csv"), readdir(folder_session, join=true)))
+
+    spectra = Vector{Vector{Float32}}()
+    wavenumbers = Vector{Vector{Float64}}()
+    true_labels = Vector{String}()
+
+    for filepath in csv_files
+        data = readdlm(filepath, ',', Float64)
+        wn_meas = data[:, 1]
+        spectrum = Float32.(data[:, 2])
+
+        push!(wavenumbers, wn_meas)
+        push!(spectra, spectrum)
+
+        filename = basename(filepath)
+        # File names are of the form "HDPE3_trn.csv", "PET1_tst.csv", etc.
+        label_key = match(r"^([A-Za-z]+)\d*_", filename).captures[1]
+        true_label = get(LABEL_MAP, label_key, "Other")
+
+        push!(true_labels, true_label)
+    end
+
+    println("Prepared data from $folder_session: $(length(spectra)) samples.")
+    return spectra, wavenumbers, true_labels
+
+end
+
+#Run full evaluation pipeline on lab session data
+function run_evaluation_session_pipeline_from_loaded_model(loaded_model :: LoadedModel, folder_session::String = "experimental_data/lab_session_1", threshold :: Float32 = 0.5f0)
+    spectra, wavenumbers, true_labels = prepare_data_lab_session(folder_session)
+    predicted_labels = evaluate_batch(spectra, wavenumbers, loaded_model, threshold)
+    overall_acc, macro_f1, conf_matrix = evaluate_performance_batch(true_labels, predicted_labels)
+    return overall_acc, macro_f1, conf_matrix
+end
+
+function run_evaluation_session_from_model_path(model_path::String, folder_session::String = "experimental_data/lab_session_1", threshold :: Float32 = 0.5f0)
+    loaded_model = load_model(model_path)
+    if loaded_model === nothing
+        println("No model loaded. Cannot run evaluation pipeline.")
+        return
+    end
+    return run_evaluation_session_pipeline_from_loaded_model(loaded_model, folder_session, threshold)
 end
 

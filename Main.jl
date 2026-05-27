@@ -9,7 +9,7 @@ using MLUtils: DataLoader
 import .GC
 
 include("src/Featurization.jl")
-include("src/ModelTransformer.jl")
+include("src/ModelNext.jl")
 include("src/LoadData.jl")
 include("src/TrainingNext.jl")
 
@@ -23,7 +23,7 @@ const CHUNKS = [
 
 const CACHE_DIR = "chunk_cache"
 const MODEL_PATH = "model.jld2"
-const ARCH_VERSION = "rescnn-v10"
+const ARCH_VERSION = "rescnn-v11"
 
 CUDA.functional() && CUDA.allowscalar(false)
 
