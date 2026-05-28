@@ -13,9 +13,6 @@ include("src/ModelNext.jl")
 include("src/LoadData.jl")
 include("src/TrainingNext.jl")
 
-#const CHUNKS = [
-#    "src/parquet-files/data/IR_data_chunk00$(i)_of_009.parquet" for i in 1:9
-#]
 
 const CHUNKS = [
     "src/parquet-files/data/IR_data_chunk$(lpad(i, 3, '0'))_of_009.parquet" for i in 1:9
