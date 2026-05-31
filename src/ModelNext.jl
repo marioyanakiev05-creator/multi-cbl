@@ -79,7 +79,7 @@ function build_model(spec_len::Int, n_fg::Int)
         ResBlock(64, 128; stride=2),
         ResBlock(128, 128; stride=2),
         Flux.flatten,          # add this
-        Dense(1920, 256, relu),  # was Dense(128, 64, relu)
+        Dense(128*94, 256, relu),  
         Dropout(0.3),
         Dense(256, n_fg),    
     )
